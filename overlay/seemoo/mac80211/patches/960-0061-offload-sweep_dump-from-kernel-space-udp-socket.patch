@@ -1,0 +1,222 @@
+diff -ruN c/drivers/net/wireless/ath/wil6210/debugfs.c d/drivers/net/wireless/ath/wil6210/debugfs.c
+--- c/drivers/net/wireless/ath/wil6210/debugfs.c	2020-11-15 22:04:47.625864721 +0000
++++ d/drivers/net/wireless/ath/wil6210/debugfs.c	2020-11-15 23:07:48.742579562 +0000
+@@ -14,12 +14,29 @@
+  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
+ 
++#include <linux/delay.h>
+ #include <linux/module.h>
+ #include <linux/debugfs.h>
+ #include <linux/seq_file.h>
+ #include <linux/pci.h>
+ #include <linux/rtnetlink.h>
+ #include <linux/power_supply.h>
++#include <linux/hash.h>
++#include <linux/slab.h> /* kmalloc() */
++/* for procfs */
++#include <linux/proc_fs.h>
++/* for linux kernel high-resolution timer */
++#include <linux/interrupt.h>
++#include <linux/hrtimer.h>
++#include <linux/sched.h>
++
++#include <linux/errno.h>
++#include <linux/types.h>
++#include <linux/netdevice.h>
++#include <linux/ip.h>
++#include <linux/in.h>
++
++/* ath driver includes */
+ #include "wil6210.h"
+ #include "wmi.h"
+ #include "txrx.h"
+@@ -64,7 +81,23 @@
+ struct wil6210_priv *my_glob_wil = NULL;
+ 
+ /* global variable to hold 'current' set of SWEEP_DUMP_SIZE individual sweep dumps : global variable fixes a wil6210 crash */
+-sweep_dump_t sweep_dump_glob, sweep_dump_glob_show;
++sweep_dump_t sweep_dump_glob, sweep_dump_glob_show, sweep_dump_glob_timer;
++
++/* for linux kernel high resolution timer : 1000 ms (or 1E9 ns) */
++#define SWEEP_DUMP_TIMER_PERIOD_NS 1000000000
++static struct hrtimer sweep_dump_hrtimer;
++static ktime_t sweep_dump_ktime;
++
++/* udp socket */
++struct socket *udp_socket;
++/* udp dest addr */
++struct sockaddr_in saddr;
++/* state variable : if udp socket connect() successful, ipc_established = true */
++bool ipc_established;
++/* ip and port BAGPIPE is listening */
++u8 bagpipe_addr[5] = {10,10,11,1,'\0'};
++#define BAGPIPE_ADDR INADDR_LOOPBACK
++#define BAGPIPE_PORT 5220
+ 
+ /* END SEEMOO ADDITIONS */
+ 
+@@ -1990,6 +2023,110 @@
+ 	.llseek		= seq_lseek,
+ };
+ 
++int ksocket_send(struct socket *sock, struct sockaddr_in *addr, unsigned char *buf, int len)
++{
++	struct msghdr msg;
++	struct iovec iov;
++	mm_segment_t oldfs;
++	int size = 0;
++
++	if (sock->sk == NULL)
++		return 0;
++
++	iov.iov_base = buf;
++	iov.iov_len = len;
++
++	msg.msg_flags = 0;
++	msg.msg_name = addr;
++	msg.msg_namelen  = sizeof(struct sockaddr_in);
++	msg.msg_control = NULL;
++	msg.msg_controllen = 0;
++	// msg.msg_iov = &iov;
++	// msg.msg_iovlen = 1;
++	iov_iter_init(&msg.msg_iter, READ, &iov, 1, len);
++	msg.msg_control = NULL;
++
++	oldfs = get_fs();
++	set_fs(KERNEL_DS);
++	size = sock_sendmsg(sock, &msg);
++	set_fs(oldfs);
++
++	return size;
++}
++
++u32 conv_addr(u8 *ip)
++{
++	u32 addr = 0;
++	int i;
++
++	for(i = 0; i < 4; i++)
++	{
++		addr += ip[i];
++		if(i == 3)
++			break;
++		addr <<= 8;
++	}
++
++	return addr;
++}
++
++int init_ipc(void)
++{
++	int ret;
++
++	/* create udp socket */
++	if (!udp_socket)
++	{
++		if(sock_create(PF_INET, SOCK_DGRAM, IPPROTO_UDP, &udp_socket) < 0)
++		{
++			printk(KERN_CRIT "sock_create() failed\n");
++			return -1;
++		}
++
++		if (udp_socket)
++			printk(KERN_CRIT "udp socket created\n");
++	}
++
++	/* create destination address */
++	saddr.sin_family = AF_INET;
++	saddr.sin_port = htons(BAGPIPE_PORT);
++	saddr.sin_addr.s_addr = htonl(conv_addr(bagpipe_addr));
++
++	/* 'connect' udp socket */
++	ret = udp_socket->ops->connect(udp_socket, (struct sockaddr *)&saddr, sizeof(saddr), 0);
++	if(ret < 0)
++	{
++		ipc_established = false;
++		printk(KERN_CRIT "udp connect() failed\n");
++		return -1;
++	}
++
++	ipc_established = true;
++	printk(KERN_CRIT "udp connect() successful\n");
++
++	return 0;
++}
++
++enum hrtimer_restart sweep_dump_udp_offload(struct hrtimer * timer)
++{
++	if (!ipc_established)
++		if (!init_ipc())
++			printk(KERN_CRIT "ipc established w/ udp server\n");
++
++	if(my_glob_wil != NULL && ipc_established) {
++		if(test_bit(WMI_FW_CAPABILITY_MOD_FW, my_glob_wil->fw_capabilities)) {
++			
++			// copy the sweep dump
++			wil_memcpy_fromio_32((void *) &sweep_dump_glob_timer, (void * __force) my_glob_wil->csr + HOSTADDR(PTR_MEM_SWEEP_DUMP), sizeof(sweep_dump_t));
++			// send sweep dump over udp
++			ksocket_send(udp_socket, &saddr, (unsigned char *) &sweep_dump_glob_timer, sizeof(sweep_dump_t));
++		} 
++	}
++
++	hrtimer_forward_now(&sweep_dump_hrtimer, sweep_dump_ktime);
++	return HRTIMER_RESTART;
++}
++
+ /*----------------*/
+ static void wil6210_debugfs_init_blobs(struct wil6210_priv *wil,
+ 				       struct dentry *dbg)
+@@ -2049,6 +2186,23 @@
+ 	{"sweep_dump_cur", 	0444,   &fops_sweep_dump_cur},
+ };
+ 
++static int wil6210_debugfs_init_kernel_socket(
++	struct wil6210_priv *wil,
++	struct dentry *dbg)
++{
++	// set timer to run every SWEEP_DUMP_TIMER_PERIOD_NS ns
++	sweep_dump_ktime = ktime_set(0, SWEEP_DUMP_TIMER_PERIOD_NS); // seconds, nanoseconds
++	// init the timer : 
++	//	- CLOCK_MONOTONIC 	: clock that always moves forward in time and not tied to 'real' time, e.g., it won't go back or forward based on ntp adjustments
++	//	- HRTIMER_MODE_REL 	: time should be interpreted relative to the current time
++	hrtimer_init(&sweep_dump_hrtimer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++	sweep_dump_hrtimer.function = sweep_dump_udp_offload;
++	// start timer
++	hrtimer_start(&sweep_dump_hrtimer, sweep_dump_ktime, HRTIMER_MODE_REL);
++
++	return 0;
++}
++
+ static void wil6210_debugfs_init_files(struct wil6210_priv *wil,
+ 				       struct dentry *dbg)
+ {
+@@ -2157,16 +2311,28 @@
+ 
+ 	wil6210_debugfs_create_ITR_CNT(wil, dbg);
+ 
++	/* initialize udp kernel socket to offload sweep dumps */
++	wil6210_debugfs_init_kernel_socket(wil, dbg);
++	/* udp socket sweep dump offload initializations */
++	udp_socket = NULL;
++	ipc_established = false;
++
+ 	return 0;
+ }
+ 
+ void wil6210_debugfs_remove(struct wil6210_priv *wil)
+ {
++	int ret = 0;
+ 	debugfs_remove_recursive(wil->debug);
+ 	wil->debug = NULL;
+ 
+ 	kfree(wil->dbg_data.data_arr);
+ 
++	/* cancel sweep dump timer */
++	ret = hrtimer_cancel(&sweep_dump_hrtimer);
++	if (ret) 
++		printk(KERN_CRIT "sweep dump timer still in use\n");
++
+ 	/* free pmc memory without sending command to fw, as it will
+ 	 * be reset on the way down anyway
+ 	 */
