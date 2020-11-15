@@ -1,6 +1,5 @@
-diff -ruN c/drivers/net/wireless/ath/wil6210/debugfs.c b/drivers/net/wireless/ath/wil6210/debugfs.c
---- c/drivers/net/wireless/ath/wil6210/debugfs.c	2020-11-15 22:04:47.625864721 +0000
-+++ b/drivers/net/wireless/ath/wil6210/debugfs.c	2020-11-15 21:55:02.081705186 +0000
+--- c/drivers/net/wireless/ath/wil6210/debugfs.c
++++ b/drivers/net/wireless/ath/wil6210/debugfs.c
 @@ -14,12 +14,23 @@
   * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
   */
