@@ -44,7 +44,7 @@ The graphs below summarize two observations from several 2 minute TCP `iperf3` s
 
 In half of the periods there are ~400 SLS frame transmissions by the AP, up to a maximum of 2109. The interval between SLSes - which encompass ~70 SLS frame exchanges each - can be as low as 1 msec in 25% of the cases. 
 
-![](/Users/adamiaonr/workbench/data/kernel-approach/graphs/sls-frame-persec.png)
+![](logos/sls-frame-summary.png)
 
 ### Possible solutions
 
