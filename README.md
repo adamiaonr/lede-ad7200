@@ -1,154 +1,107 @@
-# LEDE for Talon AD7200
-<img src="logos/talon.png" align="right" width=20% height=20%/>
-This project contains the source code to compile a LEDE image for the TP-Link Talon AD7200. With the wil6210 driver and firmware already integrated, it supports to configure the 60 GHz interface in AP, managed, and monitor mode. Therewith it allows to easily establish mm-wave links between multiple devices. Through the Linux based operating system, this allows to use the Talon AD7200 routers for arbitrary application scenarios.
+# Modifications to AD7200 drivers & firmware
 
-## Usage Report and Statistics
-Our Talon Tools framework is a research project that we share with the community so that others can reproduce our results and benefit from it. We aim to record basic statistics on where and for what purpose our tools are used. Please consider filling our short [usage report](https://goo.gl/forms/QKU0ME98f2gYhs5B2) that will only take a few minutes. You can also use this to report your publications. Doing so, you support us to keep track on the usage and allow us to continuously refine our work. 
+This fork of [seemoo-lab/lede-ad7200](https://github.com/seemoo-lab/lede-ad7200) includes modifications to the `wil6210` driver, namely:
 
-## WARNING
-This software might damage your hardware and may void your hardware’s warranty. Use our tools at your risk and responsibility.
+1. Addition of DMG `wlan.fixed.timestamp` timestamps to sweep dumps
+2. Sending sweep dumps via UDP in binary format, directly from the kernel space
 
-## Download Pre-Build Image
-To save time compiling the complete buildsystem, you can download our [pre-build images](https://github.com/seemoo-lab/lede-ad7200/releases) and directly flash it to the device (see "Device Flashing" below). If you want to integrate own functionality continue with the following build instructions.
+This README explains modification 1. Modification 2 ended up being a pointless exercise, so I'll leave an explanation for later. It can still be interesting if you want to learn how to modify the `wil6210` driver.
 
-## Quick Image Build Instructions
+These modifications should be used together with changes to the `wil6210` firmware, available [here](https://github.com/adamiaonr/nexmon-arc).
 
-This is a quick build instruction guide to compile a LEDE image for the Talon AD7200. Parts of this instruction has been taken from the official [LEDE documentation](https://lede-project.org/docs/guide-developer/quickstart-build-images) and has been adapted for the given architecture.
+## Problem
 
-First we need to make sure the dependencies are installed, you can install
-those on an Ubuntu/Debian machine (tested with ubuntu 16.4.2) with:
-```bash
-sudo apt-get install build-essential git git-core flex quilt xsltproc libxml-parser-perl 
-sudo apt-get install mercurial bzr ecj cvs subversion g++ zlib1g-dev build-essential 
-sudo apt-get install python libncurses5-dev gawk gettext unzip file libssl-dev wget
+Say you want to validate the sector choice made by the Talon AD7200 during a particular sector sweep.
+Assume that we want to validate the choice of Tx sector of the AP, given the feedback from the client. 
+
+We would need two things:
+
+1. A list of the SNR values, one per Tx sector of the AP, measured on the client
+2. The AP Tx sector chosen by the client
+
+With the tools we have at our disposal, we can easily get each piece of information as follows: 
+
+1. Generate sweep dumps, making use of modified `wil6210` firmware [[1]](https://github.com/seemoo-lab/nexmon-arc) and the `debugfs` facility provided in [[2]](https://github.com/seemoo-lab/lede-ad7200). This can be automated with [a script such as this one](https://github.com/adamiaonr/wifi-vehicles/blob/802.11ad/testbed-setup/configs/openwrt/tp-04/root/workbench/get-sweep-dump.sh).
+2. Looking at the `wlan.sswf.sector_select` field in SLS Feedback Frames (`wlan.fc.type_subtype` 362) in .pcap files using **an additional AD7200 router** in monitor mode, produced by `tcpdump`. Again, this can also be automated with [a script](https://github.com/adamiaonr/wifi-vehicles/blob/802.11ad/testbed-setup/configs/openwrt/tp-03/usr/bin/run-monitor).
+
+However, since each piece of info is captured in two different machines - let's call them **M1** and **M2** - we must link a set of SNR values in a sweep dump file to a particular SLS Feedback frame in the .pcap file.
+This is a particularly difficult task, because SLS frames do not have sequence numbers that can be used as a merging key.
+
+### Using timestamps to link sweep dumps and SLS feedback frames
+
+It is very tricky to use system-level timestamps independently taken on different machines as a merging key between sweep dumps and SLS feedback frames in a .pcap file. To make it clear, by 'system-level timestamps' I mean the numbers you get from calling `time(NULL)` in C program or running `date +"%s%N"` in the shell.
+
+The reasons are:
+
+1. With the tools we have at our disposal for capturing sweep dumps (i.e., piece #1), we cannot assign an individual timestamp to each SLS, much less to each individual SLS frame. Using the `debugfs` modifications given in [[2]](https://github.com/seemoo-lab/lede-ad7200), SLSes are gathered from the `wil6210` in batches of hundreds of SLS frames.
+2. SLSes can happen very frequently - as fast as 1 every msec - with each SLS consisting in the exchange of 72 SLS frames. Following from reason 1, a sweep dump can then assign the same timestamp to hundreds of SLS frames. 
+3. Either side - i.e., M1 and M2 - is not guaranteed to capture all the SLSes that occur in a given period of time. M1 may miss some SLSes that M2 hears, and vice-versa.
+
+The graphs below summarize two observations from three 2 minute TCP `iperf3` sessions between a 802.11ad client and AP: 
+
+* (a) Distribution of the number of SLS frames exchanged over 1 second periods
+* (b) Time interval between SLSes, when running 2 minute `iperf3` sessions
+* (c) Number of SLS frames captured in each of the tree `iperf3` sessions, as seen on the .pcap file generated by `tcpdump` and in the sweep dumps. The 'total' bar refer to the total number of SLS frames reported by the `swps` field in sweep dumps, while the 'vis(ible)' bar refers to the number of SLS frames that actually show up as rows in sweep dumps.
+
+In half of the periods there are ~400 SLS frame transmissions by the AP, up to a maximum of 2109. The interval between SLSes - which encompass ~70 SLS frame exchanges each - can be as low as 1 msec in 25% of the cases. The bars in (c) show that sweep dumps only capture a small fraction of the actual SLSes.
+
+![](logos/sls-frame-summary.png)
+
+### Possible solutions
+
+Ideally, we'd like to come up with a merging key such that:
+
+* It appears in the files produced by both M1 and M2
+* The order of appearance of SLSes and keys is the same in the timelines of both files, regardless of the offset of the clocks between the two machines
+* Keys and SLSes should be perfectly interleaved, so that to allow 100% matching between sweep dumps and SLS feedback frames. E.g., something like this : 
+
+| time @M1 | event |   | time @M2 | event |
+|------|-------|---|------|-------|
+| ... | ... |   | t1' | key 1 |
+| t1 | key 1   |   | t2' | SLS 1 FB |
+| t2 | SLS 1 list | | t3' | key 2 |
+| t3 | key 2 | | t4' | SLS 2 FB |
+| t4 | SLS 2 list | | t5' | key 3 |
+| t5 | key 3 | | ... | ... |
+| ... | ... | | ... | ... |
+
+## "Solution"
+
+**TL;DR:** Tried using DMG timestamps as the key, but it doesn't work very well, definitely not for all SLSes.
+
+
+
+## Usage instructions
+
+1. Build and flash an AD7200 router with a DMG-capable LEDE image. Using the [dmg-timestamp branch](https://github.com/adamiaonr/lede-ad7200/tree/dmg-timestamp), follow the same procedure as described in [[1]](https://github.com/seemoo-lab/lede-ad7200).
+
+2. Use [this nexmon-arc branch](https://github.com/adamiaonr/nexmon-arc) to compile a DMG-capable version of the `wi6210.fw` firmware, and copy it to the router's `/lib/firmware` folder.
+This will allow the AD7200 router to capture DMG timestamps and include the last seen DMG timestamp on sweep dump records.
+
+3. Power-cycle the router to make the firmware change effective and re-login.
+
+4. Running `cat /sys/kernel/debug/ieee80211/phy2/wil6210/sweep_dump` should now show an extra column with the title `tmstmp`, similar to the following:
+
+```
+Counter: 1661 swps, 16144 pkts
+Sector Sweep Dump: {
+ [ctr: 1635 src: 70:4f:57:72:b2:52 sec:   1 cdown:  34 dir: 1 snr:  17.25 dB (0x0114) tmstmp: 2406195860]
+ [ctr: 1635 src: 70:4f:57:72:b2:52 sec:   2 cdown:  33 dir: 1 snr:  15.94 dB (0x00ff) tmstmp: 2406195860]
+ [ctr: 1635 src: 70:4f:57:72:b2:52 sec:   3 cdown:  32 dir: 1 snr:  15.81 dB (0x00fd) tmstmp: 2406195860]
+ [ctr: 1635 src: 70:4f:57:72:b2:52 sec:   4 cdown:  31 dir: 1 snr:  15.38 dB (0x00f6) tmstmp: 2406195860]
+ [ctr: 1635 src: 70:4f:57:72:b2:52 sec:   5 cdown:  30 dir: 1 snr:  19.00 dB (0x0130) tmstmp: 2406195860]
+ (...)
 ```
 
-Obtain the source code from GitHub via:
-```bash
-git clone https://github.com/seemoo-lab/lede-ad7200.git lede-ad7200
-cd lede-ad7200
-```
+**(Optional)** If you'd like to try out further changes to the wil6210 driver after the initial compilation, you can directly modify the `debugfs.c` and/or `sweep_info.h` source files, re-compile the kernel module and then re-install it as a `.ipk` file via `opkg`. 
+Follow these steps:
 
-Fetch the latest package definitions and install corresponding symlinks:
-```bash
-./scripts/feeds update -a
-./scripts/feeds install -a
-```
+1. Modify the source files as required. The files are in the directory build\_dir/target-arm\_cortex-a15+neon-vfpv4\_musl-1.1.16\_eabi/linux-ipq806x/compat-wireless-2017-01-31/drivers/net/wireless/ath/wil6210
+	
+2. Run `make V=1` to compile your changes
+	
+3. Copy the file bin/targets/ipq806x/generic/packages/kmod-wil6210\_4.4.167+2017-01-31-14\_arm\_cortex-a15\_neon-vfpv4.ipk to the router's `/tmp` folder.
 
-To build an image with the default configuration for the Talon AD7200, simply prepare the build process with:
-```bash
-cp default.config .config
-make defconfig
-```
+4. In the router install the kernel module by running `opkg install --force-reinstall /tmp/kmod-wil6210_4.4.167\+2017-01-31-14_arm_cortex-a15_neon-vfpv4.ipk`.
 
-Alternatively, if you need to refine your configuration, start with a clean configuration and select your preferred configuration for 
-the toolchain and firmware:
-```bash
-cp legacy.config .config
-make defconfig
-make menuconfig
-```
-
-The last command will open the kernel configuration menu. Please ensure that you should select at least:
-  * *Target System* => *Qualcomm Atheros IPQ806X*
-  * *Target Profile* => *TP-Link Talon AD7200*
-
-Simply running "make" will build your firmware:
-```bash
-make
-```
-It will download all sources, build the cross-compile toolchain, 
-the kernel and all chosen applications. This may take some time on the first 
-compilation, but definitely speeds up the next time when the toolchain has been build already.
-
-To speed-up compilation using several CPU cores on multi-core computers, use:
-```bash
-make -j N
-```
-where N is your number of CPU cores + 1. However, this may lead to strange and hard-to-detect errors. 
-Use the '-j' option only if you are familiar with the build system. 
-
-To build your own firmware you need to have access to a Linux, BSD or MacOSX system
-(case-sensitive filesystem required). Cygwin will not be supported because of
-the lack of case sensitiveness in the file system.
-
-Afterwards, the images can be found in ./bin/targets/ipq806x/generic/
-The *lede-ipq806x-AD7200-squashfs-factory.bin* image should be used for installation.
-Please do not use the *lede-ipq806x-AD7200-squashfs-sysupgrade.bin* image, as this is not supported yet.
-
-
-## Device Flashing
-To flash an image to the device, you need to run a TFTP server on your machine. During recovery boot, the device will start a TFTP client and fetch the image file.
-This proceedure is default recovery mode in OpenWRT/LEDE. Check the documentation at https://lede-project.org/docs/user-guide/tftpserver and https://wiki.openwrt.org/doc/howto/generic.flashing.tftp
-You can e.g. use tftpd-hpa,
-```bash
-sudo apt-get install tftpd-hpa
-```
-and place your image file in '/var/lib/tftpboot/'. The file must be named *AD7200_1.0_tp_recovery.bin*, and your machine must be setup with fixed IP address according to the following table. 
-
- * **image name**: *AD7200_1.0_tp_recovery.bin*
- * **ip address**: *192.168.0.66*
- * **net mask**: *255.255.255.0*
-
-Only at this address and with exactly this filename the bootloader checks firmware updates.
-
-Next, you connect the Talon device with any of the LAN ports to your machine, press and hold the reset pin, and power-on the device. 
-All LEDs should turn on. Keep the reset button pressed for a couple of seconds until one of the LEDs starts blinking.
-During the flash process, most LEDs stay on. If they went off again after a few seconds, something went wrong and the device restarts. 
-In this case, you should check your network settings again. Most likely, the router cannot find find the image file.
-
-If everything went well, the LEDs stay on and flashing takes some minutes. Some devices reboot after flashing, some stuck and need to be rebooted manually. Unfortunately, there is no easy way to check if flashing is completed. After around 10 - 15 minutes, you could take the risk and manually power off and on the device. If it does not boot up with your new firmware, try flashing again and be little more patient. Good luck. 
-
-## Accessing Device via SSH
-The devices are configured by default with fixed IP address and SSH server running. You can login remotely as root via:
-```bash
-ssh root@192.168.0.1
-```
-Please ensure that you have configured your client accordingly.
-
-## Customizing the Image
-You can add additional files to the image by placing them in the */files* folder.  
-
-## Establish a 60 GHz Link
-To establish a link, you need to configure one device as AP. The default image comes with a predefined configuration, you just need to start the hostapd daemon for the *wlan2* interface:
-```bash
-hostapd -B /etc/hostapd_wlan2.conf
-```
-This will start the AP with SSID *TALON_AD7200* on channel 2 without any encryption. Other devices in manged mode and range can connect using the wpa_supplicant:
-```bash
-wpa_supplicant -Dnl80211 -iwlan2 -c/etc/wpa_supplicant.conf -B
-```
-Up 8 managed stations are supported to connect to one AP simultaneously. Finally you need to configure the IP Addresses (replace XXX by any number less than 255):
-```bash
-$ ifconfig wlan2 192.168.100.XXX
-```
-
-## Set-up Monitor Mode
-To configure a device in monitor mode on channel 2 use:
-```bash
-ifconfig wlan2 up
-iw dev wlan2 set type monitor
-iw dev wlan2 set freq 60480
-ifconfig wlan2 down
-ifconfig wlan2 up
-```
-Take note, that under heavy load the monitor mode might not catch all network packets correctly.
-
-## Talon Tools
-This software has been released as part of [Talon Tools: The Framework for Practical IEEE 802.11ad Research](https://seemoo.de/talon-tools/). Any use of it, which results in an academic publication or other publication which includes a bibliography is encouraged to appreciate this work and include a citation the Talon Tools project and any of our papers. You can find all references on Talon Tools in our [bibtex file](https://seemoo-lab.github.io/talon-tools/talon-tools.bib). Please also check the [project page](https://seemoo.de/talon-tools/) for supplemental tools.
-
-## Give us Feedback
-We want to learn how people use this software and what aspects we might improve. Please report any issues or comments using the bug-tracker and do not hesitate to approach us via e-mail.
-
-## Contact
-* [Daniel Steinmetzer](https://seemoo.tu-darmstadt.de/dsteinmetzer) <<dsteinmetzer@seemoo.tu-darmstadt.de>>
-* Daniel Wegemer <<dwegemer@seemoo.tu-darmstadt.de>>
-
-## Powered By
-<a href="https://www.seemoo.tu-darmstadt.de">![SEEMOO logo](https://seemoo-lab.github.io/talon-tools/logos/seemoo.png)</a> &nbsp;
-<a href="https://www.nicer.tu-darmstadt.de">![NICER logo](https://seemoo-lab.github.io/talon-tools/logos/nicer.png)</a> &nbsp;
-<a href="https://www.crossing.tu-darmstadt.de">![CROSSING logo](https://seemoo-lab.github.io/talon-tools/logos/crossing.jpg)</a>&nbsp;
-<a href="https://www.crisp-da.de">![CRSIP logo](https://seemoo-lab.github.io/talon-tools/logos/crisp.jpg)</a>&nbsp;
-<a href="http://www.maki.tu-darmstadt.de/">![MAKI logo](https://seemoo-lab.github.io/talon-tools/logos/maki.png)</a> &nbsp;
-<a href="https://www.cysec.tu-darmstadt.de">![CYSEC logo](https://seemoo-lab.github.io/talon-tools/logos/cysec.jpg)</a>&nbsp;
-<a href="https://www.tu-darmstadt.de/index.en.jsp">![TU Darmstadt logo](https://seemoo-lab.github.io/talon-tools/logos/tudarmstadt.png)</a>&nbsp;
+## Results 
