@@ -38,6 +38,8 @@ In addition, using system-level timestamps taken independently at M1 and M2 does
 
 ## Solution (?)
 
+### Ideal solution
+
 Ideally, we'd like to come up with a merging key such that:
 
 * It appears in the files produced by both M1 and M2
