@@ -1,6 +1,6 @@
 --- c/drivers/net/wireless/ath/wil6210/debugfs.c
 +++ b/drivers/net/wireless/ath/wil6210/debugfs.c
-@@ -14,12 +14,23 @@
+@@ -14,12 +14,24 @@
   * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
   */
  
@@ -19,12 +19,22 @@
 +#include <linux/interrupt.h>
 +#include <linux/hrtimer.h>
 +#include <linux/sched.h>
++#include <linux/ktime.h>
 +
 +/* ath driver includes */
  #include "wil6210.h"
  #include "wmi.h"
  #include "txrx.h"
-@@ -64,7 +75,35 @@
+@@ -51,7 +63,7 @@
+ /* BEGIN SEEMOO ADDITIONS BY D. Wegemer and D. Steinmetzer*/
+ #define MY_MAX_SECTOR 34
+ #define MY_SECTOR_TABLE_SIZE 16
+-#define SWEEP_DUMP_SIZE 256
++#define SWEEP_DUMP_SIZE 512
+ 
+ #define MY_CONSOLE_MAX_LEN 8192
+ u8 my_console_fw[MY_CONSOLE_MAX_LEN];
+@@ -64,7 +76,38 @@
  struct wil6210_priv *my_glob_wil = NULL;
  
  /* global variable to hold 'current' set of SWEEP_DUMP_SIZE individual sweep dumps : global variable fixes a wil6210 crash */
@@ -47,21 +57,24 @@
 +long int sweep_dump_shared_mem_free_size = 0;
 +long int sweep_dump_shared_mem_offset = 0;
 +
-+/* allocate SWEEP_DUMP_BUFFER_NUM * 5908 bytes of memory in the kernel */
-+#define SHARED_MEMORY_SIZE SWEEP_DUMP_BUFFER_NUM * sizeof(sweep_dump_t) // SWEEP_DUMP_BUFFER_NUM * 5908 byte = 59.08 kbyte
++/* allocate SWEEP_DUMP_BUFFER_NUM * sizeof(sweep_dump_t) bytes of memory in the kernel */
++#define SHARED_MEMORY_SIZE SWEEP_DUMP_BUFFER_NUM * sizeof(sweep_dump_t)
 +/*  shared memory : */
 +#define PROC_MEMSHARE_DIR "sweep_dumps"
 +#define PROC_MEMSHARE_INFO "meminfo"
 +#define PROC_MMAP_FILE "mmap"
 +
-+/* for linux kernel high resolution timer : 1000 ms (or 1E9 ns) */
-+#define SWEEP_DUMP_TIMER_PERIOD_NS 900000000
++/* for linux kernel high resolution timer : ticks every sec (or 1E9 ns) */
++#define SWEEP_DUMP_TIMER_PERIOD_NS 1000000000
 +static struct hrtimer sweep_dump_hrtimer;
 +static ktime_t sweep_dump_ktime;
++
++int avg_wil_memcpy_time_ns = 0;
++int wil_memcpy_cnt = 0;
  
  /* END SEEMOO ADDITIONS */
  
-@@ -1990,6 +2029,77 @@
+@@ -1990,6 +2033,85 @@
  	.llseek		= seq_lseek,
  };
  
@@ -111,20 +124,28 @@
 +
 +enum hrtimer_restart sweep_dump_copy_to_shared_mem(struct hrtimer * timer)
 +{
-+	if(my_glob_wil != NULL && ipc_established) {
++	// used to record time of copying the sweep dump records from the wifi chip
++	int wil_memcpy_time = 0;
++
++	if(my_glob_wil != NULL) {
 +		if(test_bit(WMI_FW_CAPABILITY_MOD_FW, my_glob_wil->fw_capabilities)) {
 +			
-+			// clear shared memory if full
++			// reset offset if shared memory buffer is full			
 +			if (sweep_dump_shared_mem_offset >= SWEEP_DUMP_BUFFER_SIZE)
 +			{
-+				memset((void *) sweep_dump_shared_mem_addr, 0, sweep_dump_shared_mem_size);
 +				sweep_dump_shared_mem_offset = 0;
 +				sweep_dump_shared_mem_free_size = sweep_dump_shared_mem_size;
++
++				printk("avg. wil_memcpy_fromio_32(%u byte) time (ns) : %d\n", sizeof(sweep_dump_t), avg_wil_memcpy_time_ns);
 +			}
-+			// copy the sweep dump
-+			wil_memcpy_fromio_32((void *) &sweep_dump_glob_timer, (void * __force) my_glob_wil->csr + HOSTADDR(PTR_MEM_SWEEP_DUMP), sizeof(sweep_dump_t));
-+			// copy the sweep dump to shared memory addr, in offsets of sizeof(sweep_dump_t) byte
-+			memcpy((void *) (sweep_dump_shared_mem_addr + sweep_dump_shared_mem_offset), (void *) &sweep_dump_glob_timer, sizeof(sweep_dump_t));
++
++			// copy the sweep dump from firmware directly to shared memory buffer (measure avg. copy time in ns)
++			wil_memcpy_time = ktime_get_ns();
++			wil_memcpy_fromio_32((void *) (sweep_dump_shared_mem_addr + sweep_dump_shared_mem_offset), (void * __force) my_glob_wil->csr + HOSTADDR(PTR_MEM_SWEEP_DUMP), sizeof(sweep_dump_t));
++			wil_memcpy_time = ktime_get_ns() - wil_memcpy_time;
++
++			avg_wil_memcpy_time_ns = avg_wil_memcpy_time_ns + ((wil_memcpy_time - avg_wil_memcpy_time_ns) / ++wil_memcpy_cnt);
++
 +			// increment by sizeof(sweep_dump_t) and reset to 0 if offset exceeds SWEEP_DUMP_BUFFER_SIZE
 +			sweep_dump_shared_mem_offset += sizeof(sweep_dump_t);
 +			// update free size indicator variable
@@ -139,7 +160,7 @@
  /*----------------*/
  static void wil6210_debugfs_init_blobs(struct wil6210_priv *wil,
  				       struct dentry *dbg)
-@@ -2049,6 +2159,65 @@
+@@ -2049,6 +2171,65 @@
  	{"sweep_dump_cur", 	0444,   &fops_sweep_dump_cur},
  };
  
@@ -205,7 +226,7 @@
  static void wil6210_debugfs_init_files(struct wil6210_priv *wil,
  				       struct dentry *dbg)
  {
-@@ -2157,15 +2326,25 @@
+@@ -2157,15 +2338,25 @@
  
  	wil6210_debugfs_create_ITR_CNT(wil, dbg);
  
@@ -231,3 +252,14 @@
  
  	/* free pmc memory without sending command to fw, as it will
  	 * be reset on the way down anyway
+--- c/drivers/net/wireless/ath/wil6210/sweep_info.h
++++ b/drivers/net/wireless/ath/wil6210/sweep_info.h
+@@ -10,7 +10,7 @@
+ // Shared between driver and firmware
+ // ---------------------------------------------------------------------------
+ 
+-#define SWEEP_DUMP_SIZE 256
++#define SWEEP_DUMP_SIZE 512
+ 
+ /*typedef struct {
+     uint16_t sector_id;
